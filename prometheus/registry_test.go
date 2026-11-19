@@ -944,6 +944,199 @@ func TestRegisterUnregisterCollector(t *testing.T) {
 	}
 }
 
+// blockingCollector blocks inside Collect until release is closed and
+// signals entry through entered. It is a checked collector, so it can be
+// unregistered.
+type blockingCollector struct {
+	desc    *prometheus.Desc
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingCollector(name string) *blockingCollector {
+	return &blockingCollector{
+		desc:    prometheus.NewDesc(name, "A test metric.", nil, nil),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (c *blockingCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+func (c *blockingCollector) Collect(ch chan<- prometheus.Metric) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, 1)
+}
+
+// TestGatherConcurrentNoDuplicates runs many Gather calls concurrently while
+// collectors are registered and unregistered in parallel. Every individual
+// Gather must produce a self-consistent snapshot without duplicate metrics and
+// without errors.
+func TestGatherConcurrentNoDuplicates(t *testing.T) {
+	const (
+		scrapes      = 100
+		collectorNum = 10
+	)
+
+	reg := prometheus.NewRegistry()
+	collectors := make([]prometheus.Collector, 0, collectorNum)
+	for i := range collectorNum {
+		col := newConstMetricsCollector(
+			"concurrent_gauge_"+strconv.Itoa(i), 5,
+		)
+		collectors = append(collectors, col)
+		if err := reg.Register(col); err != nil {
+			t.Fatalf("register collector %d: %v", i, err)
+		}
+	}
+
+	var (
+		wg          sync.WaitGroup
+		stop        = make(chan struct{})
+		mutationErr error
+		errOnce     sync.Once
+	)
+
+	// Continuously unregister and re-register collectors while scrapes are
+	// in flight to stress the snapshot and deferral logic.
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, col := range collectors {
+				if !reg.Unregister(col) {
+					errOnce.Do(func() {
+						mutationErr = errors.New("unregister returned false for a registered collector")
+					})
+					return
+				}
+				if err := reg.Register(col); err != nil {
+					errOnce.Do(func() {
+						mutationErr = fmt.Errorf("re-register collector: %w", err)
+					})
+					return
+				}
+			}
+		}
+	})
+
+	type gatherResult struct {
+		mfs []*dto.MetricFamily
+		err error
+	}
+	results := make(chan gatherResult, scrapes)
+
+	var scrapeWG sync.WaitGroup
+	for range scrapes {
+		scrapeWG.Go(func() {
+			mfs, err := reg.Gather()
+			results <- gatherResult{mfs, err}
+		})
+	}
+	scrapeWG.Wait()
+	close(stop)
+	wg.Wait()
+	close(results)
+
+	if mutationErr != nil {
+		t.Fatal(mutationErr)
+	}
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("concurrent Gather returned error: %v", res.err)
+		}
+		// Duplicate detection is scoped to a single Gather: a collector may
+		// appear in many scrapes, but the same metric must never appear twice
+		// within one scrape.
+		seen := make(map[string]struct{})
+		for _, mf := range res.mfs {
+			for _, metric := range mf.GetMetric() {
+				signature := mf.GetName() + metric.String()
+				if _, duplicate := seen[signature]; duplicate {
+					t.Fatalf("duplicate metric in one Gather: %s", signature)
+				}
+				seen[signature] = struct{}{}
+			}
+		}
+	}
+}
+
+// TestUnregisterWaitsForInFlightGather verifies that an unregistering
+// collector stays part of an in-flight Gather and Unregister only returns once
+// that Gather has completed.
+func TestUnregisterWaitsForInFlightGather(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	col := newBlockingCollector("unregister_blocking_gauge")
+	reg.MustRegister(col)
+
+	type gatherResult struct {
+		mfs []*dto.MetricFamily
+		err error
+	}
+	gathered := make(chan gatherResult, 1)
+	go func() {
+		mfs, err := reg.Gather()
+		gathered <- gatherResult{mfs, err}
+	}()
+
+	select {
+	case <-col.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Gather did not enter Collect")
+	}
+
+	unregistered := make(chan bool, 1)
+	go func() {
+		unregistered <- reg.Unregister(col)
+	}()
+
+	// Unregister must not complete while the Gather is still collecting.
+	select {
+	case ok := <-unregistered:
+		t.Fatalf("Unregister returned %v before the in-flight Gather finished", ok)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(col.release)
+
+	select {
+	case ok := <-unregistered:
+		if !ok {
+			t.Fatal("Unregister returned false for a registered collector")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Unregister did not return after the Gather finished")
+	}
+
+	select {
+	case res := <-gathered:
+		if res.err != nil {
+			t.Fatalf("in-flight Gather returned error: %v", res.err)
+		}
+		if len(res.mfs) != 1 || len(res.mfs[0].GetMetric()) != 1 {
+			t.Fatalf("in-flight Gather should contain the unregistered collector, got %v", res.mfs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight Gather did not finish")
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather after Unregister returned error: %v", err)
+	}
+	if len(mfs) != 0 {
+		t.Fatalf("Gather after Unregister should contain no metrics, got %v", mfs)
+	}
+}
+
 // TestHistogramVecRegisterGatherConcurrency is an end-to-end test that
 // concurrently calls Observe on random elements of a HistogramVec while the
 // same HistogramVec is registered concurrently and the Gather method of the

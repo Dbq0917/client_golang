@@ -73,12 +73,14 @@ func init() {
 // NewRegistry creates a new vanilla Registry without any Collectors
 // pre-registered.
 func NewRegistry() *Registry {
-	return &Registry{
+	r := &Registry{
 		collectorsByID:      map[uint64]Collector{},
 		expiredCleanersByID: map[uint64]ExpiredCleaner{},
 		descIDs:             map[uint64]struct{}{},
 		dimHashesByName:     map[string]uint64{},
 	}
+	r.gatherGate.cond.L = &r.gatherGate.mu
+	return r
 }
 
 // NewPedanticRegistry returns a registry that checks during collection if each
@@ -143,6 +145,12 @@ type Registerer interface {
 	// a different help string. The rationale here is that the same registry
 	// instance must only collect consistent metrics throughout its
 	// lifetime.
+	//
+	// If a Gather is in flight, Unregister waits for all Gathers that started
+	// before it to finish before removing the collector. Every in-flight
+	// Gather therefore observes either the fully registered or the fully
+	// unregistered collector set, and the unregistered collector is never
+	// collected again after Unregister returns.
 	Unregister(Collector) bool
 }
 
@@ -299,6 +307,55 @@ type Registry struct {
 	// lastMetricCount is the number of metrics gathered by the previous
 	// Gather call. It is used to presize the map of metric hashes.
 	lastMetricCount atomic.Int64
+
+	// gatherGate tracks Gather calls that are currently in flight. Every
+	// Gather holds a reference for its whole duration, including the actual
+	// Collect calls, which happen without holding mtx. Unregister waits for
+	// all references observed before its mutation to be released, so the
+	// collector set seen by an in-flight Gather stays stable and an
+	// unregistered collector is never collected again after Unregister
+	// returned.
+	gatherGate gatherGate
+}
+
+// gatherGate counts Gather calls in flight without serializing them. It uses
+// an independent mutex and condition variable instead of the registry mutex,
+// so concurrent Gather calls only pay for two short critical sections each and
+// never block one another, while Unregister can wait for the in-flight calls
+// to finish before mutating the registry.
+type gatherGate struct {
+	mu       sync.Mutex
+	inFlight int
+	cond     sync.Cond
+}
+
+// enter marks the beginning of a Gather call.
+func (g *gatherGate) enter() {
+	g.mu.Lock()
+	g.inFlight++
+	g.mu.Unlock()
+}
+
+// leave marks the end of a Gather call and wakes up a waiting Unregister.
+func (g *gatherGate) leave() {
+	g.mu.Lock()
+	g.inFlight--
+	if g.inFlight == 0 {
+		g.cond.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+// waitIdle blocks until every Gather that started before the call has
+// finished. It must not be called from within a Collector.Collect invoked by a
+// Gather on the same registry, as that Gather cannot finish while the call is
+// blocked here.
+func (g *gatherGate) waitIdle() {
+	g.mu.Lock()
+	for g.inFlight > 0 {
+		g.cond.Wait()
+	}
+	g.mu.Unlock()
 }
 
 // Register implements Registerer.
@@ -428,8 +485,19 @@ func (r *Registry) Unregister(c Collector) bool {
 	}
 	r.mtx.RUnlock()
 
+	// Wait outside of the registry mutex for Gathers that already took a
+	// snapshot containing this collector. This keeps the Gather hot path
+	// lock-free and avoids blocking concurrent Register calls.
+	r.gatherGate.waitIdle()
+
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
+
+	// Re-check after waiting: a concurrent Unregister may have removed the
+	// collector already.
+	if _, exists := r.collectorsByID[collectorID]; !exists {
+		return false
+	}
 
 	delete(r.collectorsByID, collectorID)
 	if _, exists := r.expiredCleanersByID[collectorID]; exists {
@@ -485,7 +553,19 @@ func (r *Registry) MustGather() []*dto.MetricFamily {
 // implement ExpiredCleaner, so expired Vec metrics can be reclaimed on scrape.
 // This includes collectors registered through wrapping collectors and nested
 // registries. Cleanup panics are recovered and reported as collection errors.
+//
+// Gather works on a stable snapshot of the registered collectors. Collectors
+// unregistered while a Gather is in flight remain part of that Gather, and
+// Unregister blocks until the in-flight Gather has finished. Concurrent Gather
+// calls do not block one another: the registry mutex is only held while taking
+// the snapshot, never while collecting.
 func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
+	// Claim an in-flight reference before taking the snapshot so that an
+	// Unregister happening concurrently cannot return before this Gather is
+	// done with its collector snapshot.
+	r.gatherGate.enter()
+	defer r.gatherGate.leave()
+
 	r.mtx.RLock()
 
 	if len(r.collectorsByID) == 0 && len(r.uncheckedCollectors) == 0 {
