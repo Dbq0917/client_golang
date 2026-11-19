@@ -498,6 +498,17 @@ type HistogramOpts struct {
 	// 5m is used. To always delete the oldest exemplar, set it to a negative value.
 	NativeHistogramExemplarTTL time.Duration
 
+	// ExemplarLimiter, if set, caps the total number of exemplars retained
+	// in memory across all histograms that share the same limiter, covering
+	// both the exemplars kept for classic buckets and those kept for native
+	// histograms. Once the limit is exceeded, the exemplars with the oldest
+	// timestamps are evicted first. Eviction only removes exemplars and
+	// never affects bucket counts, sums, or any other observation
+	// statistics. If nil (the zero value), no global limit is applied and
+	// exemplar retention is governed solely by the per-histogram settings
+	// above. See NewExemplarLimiter for details.
+	ExemplarLimiter *ExemplarLimiter
+
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
 
@@ -570,6 +581,7 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		nativeHistogramMaxBuckets:       opts.NativeHistogramMaxBucketNumber,
 		nativeHistogramMaxZeroThreshold: opts.NativeHistogramMaxZeroThreshold,
 		nativeHistogramMinResetDuration: opts.NativeHistogramMinResetDuration,
+		exemplarLimiter:                 opts.ExemplarLimiter,
 		lastResetTime:                   opts.now(),
 		now:                             opts.now,
 		afterFunc:                       opts.afterFunc,
@@ -759,6 +771,10 @@ type histogram struct {
 	// passed).
 	resetScheduled  bool
 	nativeExemplars nativeExemplars
+	// exemplarLimiter, if not nil, globally caps the number of exemplars
+	// retained across all histograms sharing it. See
+	// HistogramOpts.ExemplarLimiter.
+	exemplarLimiter *ExemplarLimiter
 
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
@@ -846,16 +862,16 @@ func (h *histogram) Write(out *dto.Metric) error {
 		bd.bucket.CumulativeCount = &bd.cumulativeCount
 		bd.bucket.UpperBound = &bd.upperBound
 		his.Bucket[i] = &bd.bucket
-		if e := h.exemplars[i].Load(); e != nil {
-			his.Bucket[i].Exemplar = e.(*dto.Exemplar)
+		if e := loadExemplar(&h.exemplars[i]); e != nil {
+			his.Bucket[i].Exemplar = e
 		}
 	}
 	// If there is an exemplar for the +Inf bucket, we have to add that bucket explicitly.
-	if e := h.exemplars[len(h.upperBounds)].Load(); e != nil {
+	if e := loadExemplar(&h.exemplars[len(h.upperBounds)]); e != nil {
 		b := &dto.Bucket{
 			CumulativeCount: new(count),
 			UpperBound:      new(math.Inf(1)),
-			Exemplar:        e.(*dto.Exemplar),
+			Exemplar:        e,
 		}
 		his.Bucket = append(his.Bucket, b)
 	}
@@ -1177,6 +1193,9 @@ func (h *histogram) resetCounts(counts *histogramCounts) {
 // With empty labels, it's a no-op. It panics if any of the labels is invalid.
 // If histogram is native, the exemplar will be cached into nativeExemplars,
 // which has a limit, and will remove one exemplar when limit is reached.
+// If an ExemplarLimiter is configured, the exemplar is also tracked by the
+// limiter, which may evict it (or older exemplars) once the global limit is
+// exceeded.
 func (h *histogram) updateExemplar(v float64, bucket int, l Labels) {
 	if l == nil {
 		return
@@ -1190,6 +1209,32 @@ func (h *histogram) updateExemplar(v float64, bucket int, l Labels) {
 	if doSparse {
 		h.nativeExemplars.addExemplar(e)
 	}
+	if h.exemplarLimiter != nil {
+		node := &exemplarNode{
+			timestamp: e.Timestamp.AsTime(),
+			exemplar:  e,
+			slot:      &h.exemplars[bucket],
+		}
+		if doSparse && h.nativeExemplars.isEnabled() {
+			node.store = &h.nativeExemplars
+		}
+		h.exemplarLimiter.track(node)
+	}
+}
+
+// loadExemplar returns the exemplar currently stored in the provided classic
+// bucket slot, or nil if the slot is empty or its exemplar has been evicted
+// by an ExemplarLimiter.
+func loadExemplar(slot *atomic.Value) *dto.Exemplar {
+	e := slot.Load()
+	if e == nil {
+		return nil
+	}
+	ex := e.(*dto.Exemplar)
+	if ex == evictedExemplar {
+		return nil
+	}
+	return ex
 }
 
 // HistogramVec is a Collector that bundles a set of Histograms that all share the
@@ -1730,6 +1775,20 @@ type nativeExemplars struct {
 
 func (n *nativeExemplars) isEnabled() bool {
 	return n.ttl != -1
+}
+
+// remove drops the provided exemplar from the store if it is still present.
+// It is a no-op if the exemplar has already been replaced by the store's own
+// retention policy.
+func (n *nativeExemplars) remove(e *dto.Exemplar) {
+	n.Lock()
+	defer n.Unlock()
+	for i, ex := range n.exemplars {
+		if ex == e {
+			n.exemplars = append(n.exemplars[:i], n.exemplars[i+1:]...)
+			return
+		}
+	}
 }
 
 func makeNativeExemplars(ttl time.Duration, maxCount int) nativeExemplars {

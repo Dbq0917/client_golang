@@ -1,5 +1,6 @@
 ## Unreleased
 
+* [FEATURE] prometheus: Add `ExemplarLimiter` and `HistogramOpts.ExemplarLimiter` to globally cap the number of exemplars retained in memory across histograms, evicting the oldest exemplars first without affecting observation statistics.
 * [CHANGE] Change required go.mod version to 1.26 #2138
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
