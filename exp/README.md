@@ -68,3 +68,53 @@ Also contains handler methods for applications that would like to handle and sto
 ```
 
 For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/api/remote).
+
+## Cardinality
+
+The `cardinality` package helps bound the cardinality of label values that are
+derived from untrusted or unbounded input, such as HTTP request paths taken
+from user input. It provides two tools whose method values satisfy the
+`func(string) string` signature of `prometheus.LabelConstraint`, so they plug
+directly into `ConstrainedLabels` without changing the instrumentation call
+site:
+
+- `Normalizer` rewrites request paths into stable route templates by
+  collapsing identifier-like segments (numeric IDs, UUIDs, long hashes) into a
+  shared sentinel, preserving route-level discrimination while removing the
+  per-resource dimension.
+- `Limiter` retains the first `MaxCardinality` distinct values verbatim and
+  collapses every further distinct value into a shared overflow value, hard
+  capping the number of exported series.
+
+```go
+    import (
+        "github.com/prometheus/client_golang/exp/cardinality"
+    )
+    ...
+
+	normalizer := cardinality.NewNormalizer(cardinality.NormalizerOpts{})
+	limiter, err := cardinality.NewLimiter(cardinality.LimiterOpts{
+		MaxCardinality: 100,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Normalize first to keep route discrimination, then cap whatever remains.
+	pathConstraint := func(path string) string {
+		return limiter.Limit(normalizer.Normalize(path))
+	}
+
+	requests := prometheus.V2.NewCounterVec(prometheus.CounterVecOpts{
+		CounterOpts: prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests.",
+		},
+		VariableLabels: prometheus.ConstrainedLabels{
+			{Name: "path", Constraint: pathConstraint},
+		},
+	})
+```
+
+For more details, see the package documentation of
+`github.com/prometheus/client_golang/exp/cardinality`.
