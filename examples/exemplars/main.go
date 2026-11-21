@@ -12,7 +12,11 @@
 // limitations under the License.
 
 // A simple example of how to record a latency metric with exemplars, using a fictional id
-// as a prometheus label.
+// as an exemplar label. A request-scoped value such as a trace ID must never be
+// attached as a regular metric label because it would create one time series per
+// request and unbounded memory growth. Exemplars are kept in bounded, per-metric
+// storage instead, so the trace ID stays available for correlation without adding
+// time series or growing the scrape payload.
 
 package main
 
@@ -50,6 +54,10 @@ func main() {
 		for {
 			// Record fictional latency.
 			now := time.Now()
+			// The dummy ID replaces the trace ID used to correlate this
+			// observation with a distributed trace. It is passed as an
+			// exemplar label, not as a metric label, to keep the number of
+			// time series constant regardless of request cardinality.
 			requestDurations.(prometheus.ExemplarObserver).ObserveWithExemplar(
 				time.Since(now).Seconds(), prometheus.Labels{"dummyID": strconv.Itoa(rand.Intn(100000))},
 			)
