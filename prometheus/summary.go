@@ -149,6 +149,21 @@ type SummaryOpts struct {
 	// "github.com/bmizerany/perks/quantile").
 	BufCap uint32
 
+	// MinSamples defines the minimum number of observations that must be
+	// present in the sliding time window (of length MaxAge) for quantile
+	// values to be reported. If the window contains fewer observations,
+	// all quantiles are reported as NaN, signaling that the estimate is
+	// too uncertain to be meaningful. This is useful at low observation
+	// rates, where quantile estimates based on only a handful of samples
+	// fluctuate wildly between scrapes and cannot be used for reliable
+	// alerting. The window length is not extended, so timeliness is
+	// preserved, and the behavior at normal observation rates is
+	// unaffected. MinSamples only applies to pre-calculated quantiles, it
+	// does not apply to _sum and _count. The default value of 0 disables
+	// the check, i.e. quantiles are always estimated from whatever
+	// samples are available.
+	MinSamples uint64
+
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
 }
@@ -260,6 +275,7 @@ func newSummary(desc *Desc, opts SummaryOpts, labelValues ...string) Summary {
 		hotBuf:         make([]float64, 0, opts.BufCap),
 		coldBuf:        make([]float64, 0, opts.BufCap),
 		streamDuration: opts.MaxAge / time.Duration(opts.AgeBuckets),
+		minSamples:     opts.MinSamples,
 	}
 	s.headStreamExpTime = opts.now().Add(s.streamDuration)
 	s.hotBufExpTime = s.headStreamExpTime
@@ -305,6 +321,7 @@ type summary struct {
 	headStream                       *quantile.Stream
 	headStreamIdx                    int
 	headStreamExpTime, hotBufExpTime time.Time
+	minSamples                       uint64
 
 	createdTs *timestamppb.Timestamp
 }
@@ -345,7 +362,10 @@ func (s *summary) Write(out *dto.Metric) error {
 
 	for _, rank := range s.sortedObjectives {
 		var q float64
-		if s.headStream.Count() == 0 {
+		if cnt := s.headStream.Count(); cnt == 0 || uint64(cnt) < s.minSamples {
+			// Report NaN if there are no samples at all or fewer
+			// samples in the sliding window than the configured
+			// MinSamples, as any estimate would be too uncertain.
 			q = math.NaN()
 		} else {
 			q = s.headStream.Query(rank)

@@ -1,5 +1,6 @@
 ## Unreleased
 
+* [FEATURE] prometheus: Add `MinSamples` to `SummaryOpts`. When the sliding time window holds fewer observations than `MinSamples`, quantiles are reported as NaN instead of a wildly fluctuating estimate, making low-traffic summaries safe to alert on. The default of 0 keeps the previous behavior.
 * [CHANGE] Change required go.mod version to 1.26 #2138
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928

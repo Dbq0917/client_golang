@@ -407,6 +407,112 @@ func TestSummaryDecay(t *testing.T) {
 	}
 }
 
+func TestSummaryMinSamples(t *testing.T) {
+	for _, tcase := range []struct {
+		desc         string
+		minSamples   uint64
+		observations int
+		wantNaN      bool
+	}{
+		{
+			desc:         "Default reports estimate with few samples.",
+			minSamples:   0,
+			observations: 3,
+			wantNaN:      false,
+		},
+		{
+			desc:         "MinSamples reached reports estimate.",
+			minSamples:   10,
+			observations: 10,
+			wantNaN:      false,
+		},
+		{
+			desc:         "Fewer samples than MinSamples reports NaN.",
+			minSamples:   10,
+			observations: 9,
+			wantNaN:      true,
+		},
+		{
+			desc:         "No samples reports NaN.",
+			minSamples:   10,
+			observations: 0,
+			wantNaN:      true,
+		},
+	} {
+		t.Run(tcase.desc, func(t *testing.T) {
+			now := time.Now()
+			sum := NewSummary(SummaryOpts{
+				Name:       "test_summary",
+				Help:       "helpless",
+				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01},
+				MaxAge:     time.Minute,
+				AgeBuckets: 6,
+				MinSamples: tcase.minSamples,
+				now:        func() time.Time { return now },
+			})
+
+			var wantSum float64
+			for i := 1; i <= tcase.observations; i++ {
+				sum.Observe(float64(i))
+				wantSum += float64(i)
+			}
+
+			m := &dto.Metric{}
+			if err := sum.Write(m); err != nil {
+				t.Fatal(err)
+			}
+			// The MinSamples check must not affect _sum and _count.
+			if got, want := m.GetSummary().GetSampleCount(), uint64(tcase.observations); got != want {
+				t.Errorf("got sample count %d, want %d", got, want)
+			}
+			if got := m.GetSummary().GetSampleSum(); got != wantSum {
+				t.Errorf("got sample sum %f, want %f", got, wantSum)
+			}
+			for _, q := range m.GetSummary().GetQuantile() {
+				if got := q.GetValue(); math.IsNaN(got) != tcase.wantNaN {
+					t.Errorf("got %f for quantile %f, want NaN: %t", got, q.GetQuantile(), tcase.wantNaN)
+				}
+			}
+		})
+	}
+}
+
+func TestSummaryMinSamplesDecay(t *testing.T) {
+	now := time.Now()
+
+	sum := NewSummary(SummaryOpts{
+		Name:       "test_summary",
+		Help:       "helpless",
+		Objectives: map[float64]float64{0.5: 0.05},
+		MaxAge:     100 * time.Millisecond,
+		AgeBuckets: 10,
+		MinSamples: 5,
+		now: func() time.Time {
+			return now
+		},
+	})
+
+	m := &dto.Metric{}
+	for i := 1; i <= 10; i++ {
+		now = now.Add(time.Millisecond)
+		sum.Observe(float64(i))
+	}
+	sum.Write(m)
+	if got := *m.Summary.Quantile[0].Value; math.IsNaN(got) {
+		t.Error("got NaN, want an estimate with MinSamples reached")
+	}
+	m.Reset()
+
+	// Simulate waiting for MaxAge without observations. The samples age
+	// out of the sliding window, so the estimate must become NaN again
+	// without the window being extended.
+	now = now.Add(100 * time.Millisecond)
+	sum.Write(m)
+	if got := *m.Summary.Quantile[0].Value; !math.IsNaN(got) {
+		t.Errorf("got %f, want NaN after samples aged out of the window", got)
+	}
+}
+
 func getBounds(vars []float64, q, ε float64) (minBound, maxBound float64) {
 	// TODO(beorn7): This currently tolerates an error of up to 2*ε. The
 	// error must be at most ε, but for some reason, it's sometimes slightly
